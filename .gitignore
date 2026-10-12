@@ -1,0 +1,54 @@
+# Build directories (CMake out-of-source builds)
+build/
+build-*/
+cmake-build-*/
+
+# CMake generated files (in case of in-source builds)
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+install_manifest.txt
+compile_commands.json
+Makefile
+!/scripts/Makefile
+*_autogen/
+.qt/
+ecm_uninstall.cmake
+prefix.sh
+
+# Compiled artifacts
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.dylib
+*.lib
+*.dll
+*.exe
+
+# Qt / KDE generated
+moc_*.cpp
+moc_*.h
+ui_*.h
+qrc_*.cpp
+*.qm
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.kdev4
+.kdev4/
+CMakeLists.txt.user*
+
+# Caches
+.cache/
+.clangd/
+
+# OS
+.DS_Store
+Thumbs.db
