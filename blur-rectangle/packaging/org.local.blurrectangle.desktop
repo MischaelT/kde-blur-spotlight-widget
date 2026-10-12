@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Blur Rectangle
+Name=Blur Spotlight
 Comment=Movable KWin blur mask
 Exec=/home/admin/.local/bin/blur-rectangle
 Icon=preferences-desktop-effects

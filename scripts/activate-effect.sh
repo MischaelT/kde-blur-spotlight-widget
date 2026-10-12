@@ -15,7 +15,7 @@ if [[ "$revision" != 'clear-zoom-popup-3' ]]; then
     printf '%s\n' \
         'The updated effect is installed, but this session is not running the expected version.' \
         'KWin may retain the old plugin library after unloading the effect.' \
-        'Save your work, log out of Plasma, and log back in. Then launch Blur Rectangle.' \
+        'Save your work, log out of Plasma, and log back in. Then launch Blur Spotlight.' \
         'If zoom remains unavailable after login, report this output for further diagnosis.'
     exit 1
 fi

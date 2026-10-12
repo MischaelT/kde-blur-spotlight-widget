@@ -119,6 +119,7 @@ private:
     bool m_blurAvailable = false;
     bool m_draggingSpotlight = false;
     bool m_resizingSpotlight = false;
+    bool m_followingMouse = false;
     bool m_minimizeHovered = false;
     bool m_minimizePressed = false;
     bool m_modeButtonHovered = false;

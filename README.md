@@ -1,10 +1,10 @@
-# Blur Rectangle
+# Blur Spotlight
 
-Blur Rectangle is a small KDE Plasma 6 / KWin Wayland utility for placing a real compositor blur mask over part of the screen. It launches directly into a fullscreen inverted spotlight mode: draggable apertures are blurred while the rest of the screen remains clear.
+Blur Spotlight is a small KDE Plasma 6 / KWin Wayland utility for placing a real compositor blur mask over part of the screen. It launches directly into a fullscreen inverted spotlight mode: draggable apertures are blurred while the rest of the screen remains clear.
 
 ## Compatibility
 
-Blur Rectangle targets KDE Plasma 6 on Wayland only. The only tested version is **Plasma 6.7.5** (KWin 6.7.5), the version installed on the author's machine. The bundled `stableblur` KWin effect is built against KWin private headers, so it is tied to the installed KWin version and may fail to build or load on other Plasma releases.
+Blur Spotlight targets KDE Plasma 6 on Wayland only. The only tested version is **Plasma 6.7.5** (KWin 6.7.5), the version installed on the author's machine. The bundled `stableblur` KWin effect is built against KWin private headers, so it is tied to the installed KWin version and may fail to build or load on other Plasma releases.
 
 ## Features
 
@@ -32,6 +32,7 @@ Spotlight mode:
 
 - Bottom-left buttons: add a spotlight (+), choose circle or rectangle shape, and invert the blur (also `I`) so only the aperture is blurred and the rest stays clear.
 - Drag inside the clear aperture to move it. Drag the circle border to resize a circle; drag the rectangle border or corners to resize a rectangle. `Alt` + `+` / `Alt` + `-` resizes the current shape from the keyboard.
+- Double-click inside a spotlight to make it stick to the mouse and follow it everywhere on screen. While it follows, the overlay captures all pointer input; double-click again or press `Esc` to drop it in place.
 - Right-click a spotlight to delete it or choose its zoom level. Deleting the last spotlight closes the overlay.
 
 Blur rectangle mode:
@@ -83,7 +84,7 @@ This verifies that the app starts with Qt's offscreen platform and that the KWin
 ./scripts/install-local.sh
 ```
 
-The app installs into `~/.local/bin/blur-rectangle`. The installer also adds a per-user KWin rule that places Blur Rectangle in the Overlay layer, above fullscreen video without taking keyboard focus. To apply the rule to an existing installation, run `bash scripts/configure-overlay.sh`. To undo it, remove the "Blur Rectangle overlay" rule in System Settings > Window Management > Window Rules.
+The app installs into `~/.local/bin/blur-rectangle`. The installer also adds a per-user KWin rule that places Blur Spotlight in the Overlay layer, above fullscreen video without taking keyboard focus. To apply the rule to an existing installation, run `bash scripts/configure-overlay.sh`. To undo it, remove the "Blur Spotlight overlay" rule in System Settings > Window Management > Window Rules.
 
 KWin on Plasma 6.7 typically loads binary effects from the system plugin directory, so the script prints the two `sudo install` commands needed to copy `stableblur.so` and `stableblur.json` into KWin's system paths. Alternatively, after building, run `bash scripts/activate-effect.sh` to install and reload the effect (uses `sudo`). Zoom requires the current version of the effect; if KWin keeps the old plugin loaded, log out and back in.
 

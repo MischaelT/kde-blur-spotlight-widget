@@ -96,7 +96,7 @@ BlurWindow::BlurWindow(QWidget *parent)
     , m_settings(QStringLiteral("local"), QStringLiteral("blur-rectangle"))
     , m_tintColor(255, 255, 255)
 {
-    setWindowTitle(QStringLiteral("Blur Rectangle"));
+    setWindowTitle(QStringLiteral("Blur Spotlight"));
     setMinimumSize(kMinimumWidth, kMinimumHeight);
     setMouseTracking(true);
     setFocusPolicy(Qt::StrongFocus);
@@ -156,6 +156,13 @@ void BlurWindow::hideEvent(QHideEvent *event)
 void BlurWindow::keyPressEvent(QKeyEvent *event)
 {
     if (event->key() == Qt::Key_Escape) {
+        if (m_followingMouse) {
+            m_followingMouse = false;
+            updateInputShape();
+            saveSettings();
+            update();
+            return;
+        }
         close();
         return;
     }
@@ -240,6 +247,21 @@ void BlurWindow::leaveEvent(QEvent *event)
 void BlurWindow::mouseDoubleClickEvent(QMouseEvent *event)
 {
     if (isSpotlightMode()) {
+        if (m_followingMouse && event->button() == Qt::LeftButton) {
+            m_followingMouse = false;
+            updateInputShape();
+            saveSettings();
+            update();
+            event->accept();
+            return;
+        }
+        if (event->button() == Qt::LeftButton && isInsideAperture(event->position())) {
+            m_followingMouse = true;
+            m_spotlightDragOffset = event->position().toPoint() - m_spotlightCenter;
+            updateInputShape();
+            event->accept();
+            return;
+        }
         QWidget::mouseDoubleClickEvent(event);
         return;
     }
@@ -259,6 +281,14 @@ void BlurWindow::mouseDoubleClickEvent(QMouseEvent *event)
 void BlurWindow::mouseMoveEvent(QMouseEvent *event)
 {
     if (isSpotlightMode()) {
+        if (m_followingMouse) {
+            m_spotlightCenter = event->position().toPoint() - m_spotlightDragOffset;
+            clampSpotlightCenter();
+            applyBlur();
+            update();
+            event->accept();
+            return;
+        }
         if (m_resizingSpotlight) {
             if (m_apertureShape == ApertureShape::Circle) {
                 setSpotlightRadius(qRound(QLineF(QPointF(m_spotlightCenter), event->position()).length()));
@@ -330,6 +360,10 @@ void BlurWindow::mouseMoveEvent(QMouseEvent *event)
 void BlurWindow::mousePressEvent(QMouseEvent *event)
 {
     if (isSpotlightMode()) {
+        if (m_followingMouse) {
+            event->accept();
+            return;
+        }
         if (event->button() == Qt::RightButton) {
             selectSpotlight(event->position().toPoint());
             showContextMenu(event->globalPosition().toPoint());
@@ -712,7 +746,7 @@ void BlurWindow::createTrayIcon()
 
     auto *trayIcon = new QSystemTrayIcon(this);
     m_trayIcon = trayIcon;
-    trayIcon->setToolTip(QStringLiteral("Blur Rectangle"));
+    trayIcon->setToolTip(QStringLiteral("Blur Spotlight"));
     trayIcon->setIcon(style()->standardIcon(QStyle::SP_TitleBarShadeButton));
     trayIcon->setContextMenu(menu);
     connect(trayIcon, &QSystemTrayIcon::activated, this, [this](QSystemTrayIcon::ActivationReason reason) {
@@ -814,6 +848,7 @@ void BlurWindow::setMode(Mode mode)
     if (m_mode == mode) {
         return;
     }
+    m_followingMouse = false;
     m_addButton->setVisible(mode == Mode::Spotlight);
 
     if (mode == Mode::Spotlight) {
@@ -1048,8 +1083,9 @@ void BlurWindow::updateInputShape()
 {
     if (isSpotlightMode()) {
         // QWindow's Wayland mask sets the input region without clipping painting.
+        // While following, the whole window takes input so the pointer is never lost.
         if (windowHandle()) {
-            windowHandle()->setMask(spotlightInputRegion());
+            windowHandle()->setMask(m_followingMouse ? QRegion(rect()) : spotlightInputRegion());
         }
         setAttribute(Qt::WA_TransparentForMouseEvents, false);
         return;

@@ -13,7 +13,7 @@ case ",$rules," in
         kwriteconfig6 --file kwinrulesrc --group General --key count "${#rule_ids[@]}"
         ;;
 esac
-kwriteconfig6 --file kwinrulesrc --group "$rule" --key Description 'Blur Rectangle overlay'
+kwriteconfig6 --file kwinrulesrc --group "$rule" --key Description 'Blur Spotlight overlay'
 kwriteconfig6 --file kwinrulesrc --group "$rule" --key wmclass blur-rectangle
 kwriteconfig6 --file kwinrulesrc --group "$rule" --key wmclasscomplete false
 kwriteconfig6 --file kwinrulesrc --group "$rule" --key wmclassmatch 1

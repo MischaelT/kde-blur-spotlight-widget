@@ -1,10 +1,10 @@
 {
     "KPlugin": {
         "Category": "Appearance",
-        "Description": "Applies a stable adjustable compositor blur to Blur Rectangle windows",
+        "Description": "Applies a stable adjustable compositor blur to Blur Spotlight windows",
         "EnabledByDefault": false,
         "License": "GPL",
-        "Name": "Stable Blur Rectangle"
+        "Name": "Stable Blur Spotlight"
     },
     "org.kde.kwin.effect": {
         "internal": true

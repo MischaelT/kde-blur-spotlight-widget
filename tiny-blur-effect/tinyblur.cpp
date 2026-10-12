@@ -59,7 +59,7 @@ static bool isBlurRectangleWindow(EffectWindow *w)
         return true;
     }
 
-    if (w->caption() == QStringLiteral("Blur Rectangle")) {
+    if (w->caption() == QStringLiteral("Blur Spotlight")) {
         return true;
     }
 
@@ -281,7 +281,7 @@ void TinyBlurEffect::updateBlurRegion(EffectWindow *w)
     }
 
     if (isMaskWindow) {
-        qCWarning(KWIN_TINYBLUR) << "Blur Rectangle registered; explicit region:" << hasExplicitBlurRegion
+        qCWarning(KWIN_TINYBLUR) << "Blur Spotlight registered; explicit region:" << hasExplicitBlurRegion
                                  << "region:" << blurRegion(w).boundingRect();
     }
 }

@@ -13,6 +13,6 @@ cmake --build "$build_dir" -j"${JOBS:-$(nproc)}"
 QT_QPA_PLATFORM=offscreen "$build_dir/blur-rectangle/blur-rectangle" --self-test
 test -f "$build_dir/bin/kwin/effects/plugins/stableblur.so" \
   || test -f "$build_dir/tiny-blur-effect/bin/kwin/effects/plugins/stableblur.so"
-grep -q '"Name": "Stable Blur Rectangle"' "$repo_dir/tiny-blur-effect/metadata.json"
+grep -q '"Name": "Stable Blur Spotlight"' "$repo_dir/tiny-blur-effect/metadata.json"
 
 echo "Smoke test passed: app starts offscreen and stableblur effect builds."
