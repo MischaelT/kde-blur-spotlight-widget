@@ -75,17 +75,18 @@ public:
     bool blocksDirectScanout() const override;
 
 public Q_SLOTS:
-    Q_SCRIPTABLE QString revision() const { return QStringLiteral("clear-zoom-popup-3"); }
+    Q_SCRIPTABLE QString revision() const { return QStringLiteral("freeform-1"); }
     Q_SCRIPTABLE void setZoomRegions(const QString &json);
     void slotWindowAdded(KWin::EffectWindow *w);
     void slotWindowDeleted(KWin::EffectWindow *w);
     void slotViewRemoved(KWin::RenderView *view);
 
 private:
-    QList<QRectF> m_zoomRegions;
+    QList<QRectF> m_apertures;
     QList<float> m_zoomFactors;
-    bool m_zoomCircle = true;
-    bool m_zoomBlurred = true;
+    bool m_apertureCircle = true;
+    QList<QVector2D> m_outline; // hand-drawn aperture polygon (0..1 of the box), empty for circles and boxes
+    bool m_apertureInverted = true;
     RegionF blurRegion(EffectWindow *w) const;
     bool shouldBlur(const EffectWindow *w, int mask, const WindowPaintData &data) const;
     void updateBlurRegion(EffectWindow *w);

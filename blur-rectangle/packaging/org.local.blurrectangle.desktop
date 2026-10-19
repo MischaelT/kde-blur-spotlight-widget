@@ -7,3 +7,4 @@ Icon=preferences-desktop-effects
 Terminal=false
 Categories=Utility;KDE;
 StartupNotify=false
+X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
