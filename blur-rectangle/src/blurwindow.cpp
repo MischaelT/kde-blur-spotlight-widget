@@ -1,5 +1,8 @@
 #include "blurwindow.h"
 
+#include "blurwindow_constants.h"
+#include "objecttracker.h"
+
 #include <KWindowEffects>
 
 #include <QAction>
@@ -27,26 +30,14 @@
 #include <QSystemTrayIcon>
 #include <QTimer>
 #include <QToolTip>
-#include <QToolButton>
 #include <QWindow>
+
+#include <algorithm>
+
+using namespace blurwindow;
 
 namespace
 {
-constexpr int kMinimumWidth = 160;
-constexpr int kMinimumHeight = 56;
-constexpr int kResizeMargin = 10;
-constexpr int kVisualRadius = 5;
-constexpr int kTitleButtonWidth = 46;
-constexpr int kTitleBarHeight = 30;
-constexpr int kSpotlightResizeMargin = 10;
-constexpr int kShapeButtonSize = 38;
-constexpr int kShapeButtonGap = 8;
-constexpr int kShapeButtonMargin = 14;
-constexpr int kMinimumSpotlightRadius = 48;
-constexpr int kMaximumSpotlightRadius = 520;
-constexpr int kMinimumSpotlightRectWidth = 96;
-constexpr int kMinimumSpotlightRectHeight = 64;
-
 void drawTitleButton(QWidget *widget,
                      QPainter *painter,
                      const QRect &rect,
@@ -95,6 +86,7 @@ BlurWindow::BlurWindow(QWidget *parent)
     : QWidget(parent)
     , m_settings(QStringLiteral("local"), QStringLiteral("blur-rectangle"))
     , m_tintColor(255, 255, 255)
+    , m_trackerFactory([] { return new ObjectTracker; })
 {
     setWindowTitle(QStringLiteral("Blur Spotlight"));
     setMinimumSize(kMinimumWidth, kMinimumHeight);
@@ -107,20 +99,56 @@ BlurWindow::BlurWindow(QWidget *parent)
     setWindowFlags(Qt::Window | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
 
     loadSettings();
-    m_addButton = new QToolButton(this);
-    m_addButton->setIcon(QIcon::fromTheme(QStringLiteral("list-add"), style()->standardIcon(QStyle::SP_FileDialogNewFolder)));
-    m_addButton->setToolTip(QStringLiteral("Add spotlight"));
-    m_addButton->setAccessibleName(QStringLiteral("Add spotlight"));
-    m_addButton->setFocusPolicy(Qt::NoFocus);
-    m_addButton->setFixedSize(kShapeButtonSize, kShapeButtonSize);
-    m_addButton->hide();
-    connect(m_addButton, &QToolButton::clicked, this, &BlurWindow::addSpotlight);
     createTrayIcon();
+    m_idleTimer = new QTimer(this);
+    m_idleTimer->setSingleShot(true);
+    m_idleTimer->setInterval(kAutoTrackIdleMs);
+    connect(m_idleTimer, &QTimer::timeout, this, [this] {
+        // Spotlight stuck to the mouse and the mouse stood still for the whole countdown: follow the
+        // object that was under it when the pointer settled, not what is under it now.
+        m_dotsTimer->stop();
+        if ((m_followingMouse || m_dragAutoTrack) && m_autoTrack) {
+            if (Tracker *pending = std::exchange(m_pendingTracker, nullptr)) {
+                m_tracker = pending;
+                registerTracking(pending);
+            } else {
+                startTracking();
+            }
+            updateInputShape();
+        }
+        update();
+    });
+    m_settleTimer = new QTimer(this);
+    m_settleTimer->setSingleShot(true);
+    m_settleTimer->setInterval(kAutoTrackSettleMs);
+    connect(m_settleTimer, &QTimer::timeout, this, &BlurWindow::beginPendingTracking);
+    // The input mask only reaches the compositor a frame or two late, so a fast pointer can outrun
+    // a following spotlight. While the pointer moves, the input area is wider; it narrows again when still.
+    m_followMoveTimer = new QTimer(this);
+    m_followMoveTimer->setSingleShot(true);
+    m_followMoveTimer->setInterval(kFollowSettleMs);
+    connect(m_followMoveTimer, &QTimer::timeout, this, [this] {
+        m_followMoving = false;
+        updateInputShape();
+    });
+    m_dotsTimer = new QTimer(this);
+    m_dotsTimer->setInterval(200);
+    connect(m_dotsTimer, &QTimer::timeout, this, qOverload<>(&QWidget::update));
+    m_trackTimer = new QTimer(this);
+    m_trackTimer->setInterval(kTrackFrameMs);
+    m_trackTimer->setTimerType(Qt::PreciseTimer);
+    connect(m_trackTimer, &QTimer::timeout, this, &BlurWindow::stepTracking);
 }
 
 BlurWindow::~BlurWindow()
 {
+    stopAllTracking();
     saveSettings();
+}
+
+void BlurWindow::setTrackerFactory(std::function<Tracker *()> factory)
+{
+    m_trackerFactory = std::move(factory);
 }
 
 void BlurWindow::showDefaultMode()
@@ -148,6 +176,7 @@ void BlurWindow::enterEvent(QEnterEvent *event)
 
 void BlurWindow::hideEvent(QHideEvent *event)
 {
+    stopAllTracking();
     publishZoomRegions();
     saveSettings();
     QWidget::hideEvent(event);
@@ -156,8 +185,22 @@ void BlurWindow::hideEvent(QHideEvent *event)
 void BlurWindow::keyPressEvent(QKeyEvent *event)
 {
     if (event->key() == Qt::Key_Escape) {
+        if (m_drawingOutline) {
+            cancelOutline();
+            return;
+        }
+        if (m_tracker || std::any_of(m_otherSpotlights.cbegin(), m_otherSpotlights.cend(),
+                                     [](const Spotlight &s) { return s.tracker; })) {
+            stopAllTracking();
+            return;
+        }
+        if (m_dragAutoTrack) {
+            cancelAutoTrack();
+            return;
+        }
         if (m_followingMouse) {
             m_followingMouse = false;
+            cancelAutoTrack();
             updateInputShape();
             saveSettings();
             update();
@@ -174,9 +217,59 @@ void BlurWindow::keyPressEvent(QKeyEvent *event)
         setMode(isSpotlightMode() ? Mode::BlurRectangle : Mode::Spotlight);
         return;
     }
-    if (isSpotlightMode() && event->key() == Qt::Key_I && event->modifiers() == Qt::NoModifier) {
-        setSpotlightInverted(!m_spotlightInverted);
+    if (event->key() == Qt::Key_Q && event->modifiers() == Qt::ControlModifier) {
+        qApp->quit();
         return;
+    }
+    if (event->key() == Qt::Key_H && event->modifiers() == Qt::NoModifier) {
+        hide();
+        return;
+    }
+    if (isSpotlightMode() && event->modifiers() == Qt::NoModifier) {
+        switch (event->key()) {
+        case Qt::Key_I:
+            setSpotlightInverted(!m_spotlightInverted);
+            return;
+        case Qt::Key_N:
+            addSpotlight();
+            return;
+        case Qt::Key_Delete:
+            deleteSpotlight();
+            return;
+        case Qt::Key_T:
+            if (m_tracker) {
+                stopTracking();
+            } else {
+                startTracking();
+            }
+            return;
+        case Qt::Key_A:
+            m_autoTrack = !m_autoTrack;
+            if (!m_autoTrack) {
+                cancelAutoTrack();
+            } else if (m_followingMouse) {
+                armAutoTrack();
+            }
+            saveSettings();
+            return;
+        case Qt::Key_W:
+            setAutoSize(!m_autoSize);
+            return;
+        case Qt::Key_C:
+            setApertureShape(ApertureShape::Circle);
+            return;
+        case Qt::Key_R:
+            setApertureShape(ApertureShape::Rectangle);
+            return;
+        case Qt::Key_F:
+            startDrawingOutline();
+            return;
+        case Qt::Key_Z:
+            cycleZoom();
+            return;
+        default:
+            break;
+        }
     }
 
     if (isSpotlightMode() && event->modifiers().testFlag(Qt::AltModifier)) {
@@ -232,12 +325,6 @@ void BlurWindow::leaveEvent(QEvent *event)
         m_modeButtonPressed = false;
         m_closeHovered = false;
         m_closePressed = false;
-        m_circleShapeHovered = false;
-        m_circleShapePressed = false;
-        m_rectangleShapeHovered = false;
-        m_rectangleShapePressed = false;
-        m_invertHovered = false;
-        m_invertPressed = false;
         unsetCursor();
         updateInputShape();
         update();
@@ -249,6 +336,7 @@ void BlurWindow::mouseDoubleClickEvent(QMouseEvent *event)
     if (isSpotlightMode()) {
         if (m_followingMouse && event->button() == Qt::LeftButton) {
             m_followingMouse = false;
+            cancelAutoTrack();
             updateInputShape();
             saveSettings();
             update();
@@ -256,8 +344,12 @@ void BlurWindow::mouseDoubleClickEvent(QMouseEvent *event)
             return;
         }
         if (event->button() == Qt::LeftButton && isInsideAperture(event->position())) {
+            stopTracking();
             m_followingMouse = true;
             m_spotlightDragOffset = event->position().toPoint() - m_spotlightCenter;
+            if (m_autoTrack) {
+                armAutoTrack();
+            }
             updateInputShape();
             event->accept();
             return;
@@ -281,10 +373,24 @@ void BlurWindow::mouseDoubleClickEvent(QMouseEvent *event)
 void BlurWindow::mouseMoveEvent(QMouseEvent *event)
 {
     if (isSpotlightMode()) {
+        if (m_drawingOutline) {
+            if (!m_stroke.isEmpty() && QLineF(m_stroke.last(), event->position()).length() >= 3) {
+                m_stroke << event->position();
+                update();
+            }
+            event->accept();
+            return;
+        }
         if (m_followingMouse) {
+            if (m_autoTrack) {
+                armAutoTrack();
+            }
+            m_followMoving = true;
+            m_followMoveTimer->start();
             m_spotlightCenter = event->position().toPoint() - m_spotlightDragOffset;
             clampSpotlightCenter();
             applyBlur();
+            updateInputShape();
             update();
             event->accept();
             return;
@@ -330,6 +436,10 @@ void BlurWindow::mouseMoveEvent(QMouseEvent *event)
             return;
         }
         if (m_draggingSpotlight) {
+            if (m_autoTrack) {
+                m_dragAutoTrack = true;
+                armAutoTrack();
+            }
             m_spotlightCenter = event->position().toPoint() - m_spotlightDragOffset;
             clampSpotlightCenter();
             applyBlur();
@@ -337,6 +447,9 @@ void BlurWindow::mouseMoveEvent(QMouseEvent *event)
             update();
             event->accept();
             return;
+        }
+        if (m_dragAutoTrack) {
+            cancelAutoTrack();
         }
         selectSpotlight(event->position().toPoint());
         updateCursor(event->position().toPoint());
@@ -360,9 +473,23 @@ void BlurWindow::mouseMoveEvent(QMouseEvent *event)
 void BlurWindow::mousePressEvent(QMouseEvent *event)
 {
     if (isSpotlightMode()) {
-        if (m_followingMouse) {
+        if (m_drawingOutline) {
+            if (event->button() == Qt::LeftButton) {
+                m_stroke.clear();
+                m_stroke << event->position();
+            }
             event->accept();
             return;
+        }
+        if (m_followingMouse) {
+            if (event->button() == Qt::RightButton) {
+                showContextMenu(event->globalPosition().toPoint());
+            }
+            event->accept();
+            return;
+        }
+        if (m_dragAutoTrack) {
+            cancelAutoTrack();
         }
         if (event->button() == Qt::RightButton) {
             selectSpotlight(event->position().toPoint());
@@ -373,44 +500,9 @@ void BlurWindow::mousePressEvent(QMouseEvent *event)
             QWidget::mousePressEvent(event);
             return;
         }
-        if (minimizeButtonRect().contains(event->position().toPoint())) {
-            m_minimizePressed = true;
-            update(minimizeButtonRect());
-            event->accept();
-            return;
-        }
-        if (modeButtonRect().contains(event->position().toPoint())) {
-            m_modeButtonPressed = true;
-            update(modeButtonRect());
-            event->accept();
-            return;
-        }
-        if (closeButtonRect().contains(event->position().toPoint())) {
-            m_closePressed = true;
-            update(closeButtonRect());
-            event->accept();
-            return;
-        }
-        if (circleShapeButtonRect().contains(event->position().toPoint())) {
-            m_circleShapePressed = true;
-            update(circleShapeButtonRect());
-            event->accept();
-            return;
-        }
-        if (rectangleShapeButtonRect().contains(event->position().toPoint())) {
-            m_rectangleShapePressed = true;
-            update(rectangleShapeButtonRect());
-            event->accept();
-            return;
-        }
-        if (invertButtonRect().contains(event->position().toPoint())) {
-            m_invertPressed = true;
-            update(invertButtonRect());
-            event->accept();
-            return;
-        }
         selectSpotlight(event->position().toPoint());
         if (isOnSpotlightBorder(event->position())) {
+            stopTracking();
             m_resizingSpotlight = true;
             m_spotlightResizeEdges = spotlightRectEdgesAt(event->position().toPoint());
             m_spotlightResizeStartPosition = event->position().toPoint();
@@ -424,6 +516,7 @@ void BlurWindow::mousePressEvent(QMouseEvent *event)
             return;
         }
         if (isInsideAperture(event->position())) {
+            stopTracking();
             m_draggingSpotlight = true;
             m_spotlightDragOffset = event->position().toPoint() - m_spotlightCenter;
             setInteractiveState(true);
@@ -496,53 +589,19 @@ void BlurWindow::mousePressEvent(QMouseEvent *event)
 void BlurWindow::mouseReleaseEvent(QMouseEvent *event)
 {
     if (isSpotlightMode()) {
+        if (m_drawingOutline) {
+            if (event->button() == Qt::LeftButton && !m_stroke.isEmpty()) {
+                finishOutline();
+            }
+            event->accept();
+            return;
+        }
         if (event->button() == Qt::LeftButton) {
-            const bool minimizeWasPressed = m_minimizePressed;
-            m_minimizePressed = false;
-            const bool modeButtonWasPressed = m_modeButtonPressed;
-            m_modeButtonPressed = false;
-            const bool closeWasPressed = m_closePressed;
-            m_closePressed = false;
-            const bool circleWasPressed = m_circleShapePressed;
-            const bool rectangleWasPressed = m_rectangleShapePressed;
-            const bool invertWasPressed = m_invertPressed;
-            m_circleShapePressed = false;
-            m_rectangleShapePressed = false;
-            m_invertPressed = false;
             m_resizingSpotlight = false;
             m_spotlightResizeEdges = NoEdge;
             m_draggingSpotlight = false;
             setInteractiveState(false);
             saveSettings();
-            if (minimizeWasPressed && minimizeButtonRect().contains(event->position().toPoint())) {
-                showMinimized();
-                event->accept();
-                return;
-            }
-            if (modeButtonWasPressed && modeButtonRect().contains(event->position().toPoint())) {
-                setMode(Mode::BlurRectangle);
-                event->accept();
-                return;
-            }
-            if (closeWasPressed && closeButtonRect().contains(event->position().toPoint())) {
-                close();
-                return;
-            }
-            if (circleWasPressed && circleShapeButtonRect().contains(event->position().toPoint())) {
-                setApertureShape(ApertureShape::Circle);
-                event->accept();
-                return;
-            }
-            if (rectangleWasPressed && rectangleShapeButtonRect().contains(event->position().toPoint())) {
-                setApertureShape(ApertureShape::Rectangle);
-                event->accept();
-                return;
-            }
-            if (invertWasPressed && invertButtonRect().contains(event->position().toPoint())) {
-                setSpotlightInverted(!m_spotlightInverted);
-                event->accept();
-                return;
-            }
             update();
             event->accept();
             return;
@@ -604,28 +663,46 @@ void BlurWindow::paintEvent(QPaintEvent *)
     if (isSpotlightMode()) {
         QPainterPath overlay;
         overlay.addRect(rect());
-        QPainterPath aperture;
-        if (m_apertureShape == ApertureShape::Circle) {
-            aperture.addEllipse(spotlightRect());
-        } else {
-            aperture.addRect(spotlightRectangleRect());
-        }
+        QPainterPath aperture = aperturePath(spotlightBounds({m_spotlightCenter, m_spotlightRadius, m_spotlightRectSize}));
         aperture.setFillRule(Qt::WindingFill);
         for (const Spotlight &spotlight : m_otherSpotlights) {
-            if (m_apertureShape == ApertureShape::Circle) {
-                aperture.addEllipse(spotlightBounds(spotlight));
-            } else {
-                aperture.addRect(spotlightBounds(spotlight));
-            }
+            aperture.addPath(aperturePath(spotlightBounds(spotlight)));
         }
         if (m_spotlightInverted) {
             painter.fillPath(aperture, QColor(255, 255, 255, 1));
         } else {
             painter.fillPath(overlay.subtracted(aperture), QColor(255, 255, 255, 1));
         }
-
-        drawShapeButtons(&painter);
-        drawTitleButtons(&painter);
+        if ((m_followingMouse || m_dragAutoTrack) && m_autoTrack && m_idleTimer->isActive()
+            && kAutoTrackIdleMs - m_idleTimer->remainingTime() >= 800) {
+            // Autotrack countdown: one more dot for each second the mouse stands still.
+            const int elapsed = kAutoTrackIdleMs - m_idleTimer->remainingTime();
+            const int dots = qMin((elapsed + 200) / 1000, 3); // the object is memorized well before the first dot
+            QFont font = painter.font();
+            font.setPixelSize(40);
+            font.setBold(true);
+            QPainterPath text;
+            const QRectF area = spotlightBounds({m_spotlightCenter, m_spotlightRadius, m_spotlightRectSize});
+            text.addText(0, 0, font, QString(dots, QLatin1Char('.')));
+            text.translate(area.center() - text.boundingRect().center());
+            painter.setPen(QPen(QColor(0, 0, 0, 200), 4, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin));
+            painter.drawPath(text);
+            painter.fillPath(text, QColor(255, 255, 255));
+        }
+        if (m_drawingOutline && m_stroke.size() > 1) {
+            // Dotted line: white dots on a dark trail, plus a fainter dotted line back to the start.
+            QPen halo(QColor(0, 0, 0, 170), 5, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+            QPen dots(QColor(255, 255, 255), 3, Qt::CustomDashLine, Qt::RoundCap, Qt::RoundJoin);
+            dots.setDashPattern({0.1, 2.2});
+            painter.setPen(halo);
+            painter.drawPolyline(m_stroke);
+            painter.setPen(dots);
+            painter.drawPolyline(m_stroke);
+            dots.setColor(QColor(255, 255, 255, 120));
+            dots.setWidth(2);
+            painter.setPen(dots);
+            painter.drawLine(m_stroke.last(), m_stroke.first());
+        }
         return;
     }
 
@@ -654,9 +731,6 @@ void BlurWindow::paintEvent(QPaintEvent *)
 void BlurWindow::resizeEvent(QResizeEvent *event)
 {
     QWidget::resizeEvent(event);
-    if (m_addButton) {
-        m_addButton->move(invertButtonRect().translated(kShapeButtonSize + kShapeButtonGap, 0).topLeft());
-    }
     if (isSpotlightMode()) {
         clampSpotlightCenter();
     }
@@ -701,68 +775,6 @@ void BlurWindow::applyBlur()
     update();
 }
 
-void BlurWindow::createTrayIcon()
-{
-    if (!QSystemTrayIcon::isSystemTrayAvailable()) {
-        return;
-    }
-
-    auto *menu = new QMenu(this);
-    m_trayMenu = menu;
-
-    QAction *showHideAction = menu->addAction(QStringLiteral("Show/Hide"));
-    connect(showHideAction, &QAction::triggered, this, [this] {
-        setVisible(!isVisible());
-        if (isVisible()) {
-            raise();
-            if (!isSpotlightMode()) {
-                activateWindow();
-            }
-        }
-    });
-
-    QAction *rectangleModeAction = menu->addAction(QStringLiteral("Blur rectangle mode"));
-    connect(rectangleModeAction, &QAction::triggered, this, [this] {
-        setMode(Mode::BlurRectangle);
-    });
-
-    QAction *spotlightModeAction = menu->addAction(QStringLiteral("Spotlight blocker mode"));
-    connect(spotlightModeAction, &QAction::triggered, this, [this] {
-        setMode(Mode::Spotlight);
-    });
-    connect(menu, &QMenu::aboutToShow, this, [this, rectangleModeAction, spotlightModeAction] {
-        rectangleModeAction->setVisible(isSpotlightMode());
-        spotlightModeAction->setVisible(!isSpotlightMode());
-    });
-
-    QAction *clickThroughAction = menu->addAction(QStringLiteral("Click-through"));
-    clickThroughAction->setCheckable(true);
-    clickThroughAction->setChecked(m_clickThrough);
-    connect(clickThroughAction, &QAction::toggled, this, &BlurWindow::setClickThrough);
-
-    menu->addSeparator();
-    QAction *quitAction = menu->addAction(QStringLiteral("Quit"));
-    connect(quitAction, &QAction::triggered, qApp, &QCoreApplication::quit);
-
-    auto *trayIcon = new QSystemTrayIcon(this);
-    m_trayIcon = trayIcon;
-    trayIcon->setToolTip(QStringLiteral("Blur Spotlight"));
-    trayIcon->setIcon(style()->standardIcon(QStyle::SP_TitleBarShadeButton));
-    trayIcon->setContextMenu(menu);
-    connect(trayIcon, &QSystemTrayIcon::activated, this, [this](QSystemTrayIcon::ActivationReason reason) {
-        if (reason == QSystemTrayIcon::Trigger || reason == QSystemTrayIcon::DoubleClick) {
-            setVisible(!isVisible());
-            if (isVisible()) {
-                raise();
-                if (!isSpotlightMode()) {
-                    activateWindow();
-                }
-            }
-        }
-    });
-    trayIcon->show();
-}
-
 void BlurWindow::loadSettings()
 {
     const QSize defaultSize(360, 130);
@@ -771,15 +783,23 @@ void BlurWindow::loadSettings()
     m_borderAlpha = qBound(40, m_settings.value(QStringLiteral("borderAlpha"), 210).toInt(), 255);
     m_blurLevel = qBound(1, m_settings.value(QStringLiteral("blurLevel"), 4).toInt(), 10);
     m_clickThrough = m_settings.value(QStringLiteral("clickThrough"), false).toBool();
+    m_autoTrack = m_settings.value(QStringLiteral("autoTrack"), false).toBool();
+    m_autoSize = m_settings.value(QStringLiteral("autoSize"), false).toBool();
     m_spotlightRadius = qBound(kMinimumSpotlightRadius,
                                m_settings.value(QStringLiteral("spotlightRadius"), 140).toInt(),
                                kMaximumSpotlightRadius);
     m_spotlightCenter = m_settings.value(QStringLiteral("spotlightCenter"), QPoint(420, 280)).toPoint();
     m_spotlightRectSize = m_settings.value(QStringLiteral("spotlightRectSize"), QSize(320, 190)).toSize()
                               .expandedTo(QSize(kMinimumSpotlightRectWidth, kMinimumSpotlightRectHeight));
-    m_apertureShape = m_settings.value(QStringLiteral("apertureShape"), QStringLiteral("circle")).toString() == QStringLiteral("rectangle")
-        ? ApertureShape::Rectangle
-        : ApertureShape::Circle;
+    const QString shape = m_settings.value(QStringLiteral("apertureShape"), QStringLiteral("circle")).toString();
+    m_apertureShape = shape == QStringLiteral("rectangle") ? ApertureShape::Rectangle : ApertureShape::Circle;
+    const QVariantList outline = m_settings.value(QStringLiteral("freeformOutline")).toList();
+    for (qsizetype i = 0; i + 1 < outline.size(); i += 2) {
+        m_outline << QPointF(outline.at(i).toDouble(), outline.at(i + 1).toDouble());
+    }
+    if (shape == QStringLiteral("freeform") && m_outline.size() >= 3) {
+        m_apertureShape = ApertureShape::Freeform;
+    }
     m_spotlightInverted = m_settings.value(QStringLiteral("spotlightInverted"), false).toBool();
 }
 
@@ -792,11 +812,19 @@ void BlurWindow::saveSettings()
     m_settings.setValue(QStringLiteral("borderAlpha"), m_borderAlpha);
     m_settings.setValue(QStringLiteral("blurLevel"), m_blurLevel);
     m_settings.setValue(QStringLiteral("clickThrough"), m_clickThrough);
+    m_settings.setValue(QStringLiteral("autoTrack"), m_autoTrack);
+    m_settings.setValue(QStringLiteral("autoSize"), m_autoSize);
     m_settings.setValue(QStringLiteral("spotlightRadius"), m_spotlightRadius);
     m_settings.setValue(QStringLiteral("spotlightRectSize"), m_spotlightRectSize);
     m_settings.setValue(QStringLiteral("spotlightCenter"), m_spotlightCenter);
     m_settings.setValue(QStringLiteral("apertureShape"),
-                        m_apertureShape == ApertureShape::Rectangle ? QStringLiteral("rectangle") : QStringLiteral("circle"));
+                        m_apertureShape == ApertureShape::Rectangle ? QStringLiteral("rectangle")
+                        : m_apertureShape == ApertureShape::Freeform ? QStringLiteral("freeform") : QStringLiteral("circle"));
+    QVariantList outline;
+    for (const QPointF &point : m_outline) {
+        outline << point.x() << point.y();
+    }
+    m_settings.setValue(QStringLiteral("freeformOutline"), outline);
     m_settings.setValue(QStringLiteral("spotlightInverted"), m_spotlightInverted);
 }
 
@@ -849,7 +877,8 @@ void BlurWindow::setMode(Mode mode)
         return;
     }
     m_followingMouse = false;
-    m_addButton->setVisible(mode == Mode::Spotlight);
+    cancelAutoTrack();
+    stopAllTracking();
 
     if (mode == Mode::Spotlight) {
         m_normalGeometry = geometry();
@@ -937,84 +966,19 @@ void BlurWindow::setInteractiveState(bool active)
     update();
 }
 
-void BlurWindow::showContextMenu(const QPoint &globalPosition)
-{
-    QMenu menu(this);
-    QAction *deleteAction = nullptr;
-    QActionGroup zoomActions(&menu);
-    zoomActions.setExclusive(true);
-    const QPoint local = mapFromGlobal(globalPosition);
-    if (isSpotlightMode() && (isInsideAperture(local) || isOnSpotlightBorder(local))) {
-        deleteAction = menu.addAction(QIcon::fromTheme(QStringLiteral("edit-delete")), QStringLiteral("Delete spotlight"));
-        QMenu *zoomMenu = menu.addMenu(QIcon::fromTheme(QStringLiteral("zoom-in")), QStringLiteral("Zoom"));
-        for (double factor : {1.0, 1.15, 1.25, 1.5, 2.0, 3.0}) {
-            QAction *action = zoomMenu->addAction(factor == 1.0 ? QStringLiteral("Off (1x)")
-                                                              : QStringLiteral("%1x").arg(factor));
-            action->setCheckable(true);
-            action->setData(factor);
-            action->setChecked(qFuzzyCompare(m_spotlightZoom, factor));
-            zoomActions.addAction(action);
-        }
-        const QDBusInterface zoomEffect(QStringLiteral("org.kde.KWin"), QStringLiteral("/org/local/StableBlur"),
-                                        QStringLiteral("org.local.StableBlur"));
-        zoomMenu->setEnabled(zoomEffect.isValid() && !m_spotlightInverted);
-        if (m_spotlightInverted) {
-            zoomMenu->menuAction()->setToolTip(QStringLiteral("Zoom is available when the spotlight is clear"));
-            menu.setToolTipsVisible(true);
-        }
-        if (!zoomEffect.isValid()) {
-            zoomMenu->menuAction()->setToolTip(QStringLiteral("Install and reload the updated Stable Blur effect to enable zoom"));
-            menu.setToolTipsVisible(true);
-        }
-        menu.addSeparator();
-    }
-    QAction *hideAction = menu.addAction(QStringLiteral("Hide"));
-    QAction *rectangleModeAction = menu.addAction(QStringLiteral("Blur rectangle mode"));
-    QAction *spotlightModeAction = menu.addAction(QStringLiteral("Spotlight blocker mode"));
-    rectangleModeAction->setVisible(isSpotlightMode());
-    spotlightModeAction->setVisible(!isSpotlightMode());
-    QAction *clickThroughAction = menu.addAction(QStringLiteral("Click-through"));
-    clickThroughAction->setCheckable(true);
-    clickThroughAction->setChecked(m_clickThrough);
-    clickThroughAction->setEnabled(!isSpotlightMode());
-    menu.addSeparator();
-    QAction *quitAction = menu.addAction(QStringLiteral("Quit"));
-
-    QAction *chosen = menu.exec(globalPosition);
-    if (!chosen) {
-        return;
-    }
-    if (chosen == deleteAction) {
-        deleteSpotlight();
-    } else if (zoomActions.actions().contains(chosen)) {
-        m_spotlightZoom = chosen->data().toDouble();
-        QTimer::singleShot(0, this, &BlurWindow::applyBlur);
-    } else if (chosen == hideAction) {
-        hide();
-    } else if (chosen == rectangleModeAction) {
-        setMode(Mode::BlurRectangle);
-    } else if (chosen == spotlightModeAction) {
-        setMode(Mode::Spotlight);
-    } else if (chosen == clickThroughAction) {
-        setClickThrough(clickThroughAction->isChecked());
-    } else if (chosen == quitAction) {
-        qApp->quit();
-    }
-}
-
 void BlurWindow::updateCursor(const QPoint &position)
 {
-    const bool minimizeHovered = minimizeButtonRect().contains(position);
+    const bool minimizeHovered = !isSpotlightMode() && minimizeButtonRect().contains(position);
     if (m_minimizeHovered != minimizeHovered) {
         m_minimizeHovered = minimizeHovered;
         update(minimizeButtonRect().adjusted(-2, -2, 2, 2));
     }
-    const bool modeButtonHovered = modeButtonRect().contains(position);
+    const bool modeButtonHovered = !isSpotlightMode() && modeButtonRect().contains(position);
     if (m_modeButtonHovered != modeButtonHovered) {
         m_modeButtonHovered = modeButtonHovered;
         update(modeButtonRect().adjusted(-2, -2, 2, 2));
     }
-    const bool closeHovered = closeButtonRect().contains(position);
+    const bool closeHovered = !isSpotlightMode() && closeButtonRect().contains(position);
     if (m_closeHovered != closeHovered) {
         m_closeHovered = closeHovered;
         update(closeButtonRect().adjusted(-2, -2, 2, 2));
@@ -1025,24 +989,7 @@ void BlurWindow::updateCursor(const QPoint &position)
     }
 
     if (isSpotlightMode()) {
-        const bool circleHovered = circleShapeButtonRect().contains(position);
-        const bool rectangleHovered = rectangleShapeButtonRect().contains(position);
-        const bool invertHovered = invertButtonRect().contains(position);
-        if (m_circleShapeHovered != circleHovered) {
-            m_circleShapeHovered = circleHovered;
-            update(circleShapeButtonRect().adjusted(-2, -2, 2, 2));
-        }
-        if (m_rectangleShapeHovered != rectangleHovered) {
-            m_rectangleShapeHovered = rectangleHovered;
-            update(rectangleShapeButtonRect().adjusted(-2, -2, 2, 2));
-        }
-        if (m_invertHovered != invertHovered) {
-            m_invertHovered = invertHovered;
-            update(invertButtonRect().adjusted(-2, -2, 2, 2));
-        }
-        if (circleHovered || rectangleHovered || invertHovered) {
-            setCursor(Qt::PointingHandCursor);
-        } else if (m_resizingSpotlight || isOnSpotlightBorder(position)) {
+        if (m_resizingSpotlight || isOnSpotlightBorder(position)) {
             const Edges edges = m_resizingSpotlight ? m_spotlightResizeEdges : spotlightRectEdgesAt(position);
             if ((edges.testFlag(LeftEdge) && edges.testFlag(TopEdge)) || (edges.testFlag(RightEdge) && edges.testFlag(BottomEdge))) {
                 setCursor(Qt::SizeFDiagCursor);
@@ -1083,9 +1030,9 @@ void BlurWindow::updateInputShape()
 {
     if (isSpotlightMode()) {
         // QWindow's Wayland mask sets the input region without clipping painting.
-        // While following, the whole window takes input so the pointer is never lost.
+        // Only the apertures take input, so other windows stay usable, also while following the mouse.
         if (windowHandle()) {
-            windowHandle()->setMask(m_followingMouse ? QRegion(rect()) : spotlightInputRegion());
+            windowHandle()->setMask(m_drawingOutline ? QRegion(rect()) : spotlightInputRegion());
         }
         setAttribute(Qt::WA_TransparentForMouseEvents, false);
         return;
@@ -1132,7 +1079,7 @@ BlurWindow::Edges BlurWindow::edgesAt(const QPoint &position) const
 
 BlurWindow::Edges BlurWindow::spotlightRectEdgesAt(const QPoint &position) const
 {
-    if (m_apertureShape != ApertureShape::Rectangle) {
+    if (m_apertureShape == ApertureShape::Circle) {
         return NoEdge;
     }
 
@@ -1159,10 +1106,90 @@ BlurWindow::Edges BlurWindow::spotlightRectEdgesAt(const QPoint &position) const
 
 QRegion BlurWindow::apertureRegion() const
 {
+    return apertureRegionIn(spotlightBounds({m_spotlightCenter, m_spotlightRadius, m_spotlightRectSize}));
+}
+
+QPainterPath BlurWindow::aperturePath(const QRectF &bounds) const
+{
+    QPainterPath path;
     if (m_apertureShape == ApertureShape::Circle) {
-        return QRegion(spotlightRect().toAlignedRect(), QRegion::Ellipse);
+        path.addEllipse(bounds);
+    } else if (m_apertureShape == ApertureShape::Freeform && m_outline.size() >= 3) {
+        QPolygonF polygon;
+        for (const QPointF &point : m_outline) {
+            polygon << QPointF(bounds.x() + point.x() * bounds.width(), bounds.y() + point.y() * bounds.height());
+        }
+        path.addPolygon(polygon);
+        path.closeSubpath();
+    } else {
+        path.addRect(bounds);
     }
-    return QRegion(spotlightRectangleRect().toAlignedRect());
+    return path;
+}
+
+QRegion BlurWindow::apertureRegionIn(const QRectF &bounds) const
+{
+    if (m_apertureShape == ApertureShape::Circle) {
+        return QRegion(bounds.toAlignedRect(), QRegion::Ellipse);
+    }
+    if (m_apertureShape == ApertureShape::Freeform && m_outline.size() >= 3) {
+        return QRegion(aperturePath(bounds).toFillPolygon().toPolygon(), Qt::WindingFill);
+    }
+    return QRegion(bounds.toAlignedRect());
+}
+
+void BlurWindow::startDrawingOutline()
+{
+    if (!isSpotlightMode()) {
+        return;
+    }
+    m_followingMouse = false;
+    cancelAutoTrack();
+    m_drawingOutline = true;
+    m_stroke.clear();
+    setCursor(Qt::CrossCursor);
+    updateInputShape();
+    update();
+}
+
+void BlurWindow::cancelOutline()
+{
+    m_drawingOutline = false;
+    m_stroke.clear();
+    unsetCursor();
+    updateInputShape();
+    update();
+}
+
+// The drawn stroke becomes the aperture of the current spotlight, placed where it was drawn.
+void BlurWindow::finishOutline()
+{
+    const QRectF box = m_stroke.boundingRect();
+    if (m_stroke.size() < 8 || box.width() < kMinimumSpotlightRectWidth / 2 || box.height() < kMinimumSpotlightRectHeight / 2) {
+        cancelOutline();
+        return;
+    }
+    // Keep at most about 200 points.
+    const int step = qMax<qsizetype>(1, m_stroke.size() / 200);
+    QPolygonF outline;
+    for (qsizetype i = 0; i < m_stroke.size(); i += step) {
+        outline << QPointF((m_stroke.at(i).x() - box.x()) / box.width(), (m_stroke.at(i).y() - box.y()) / box.height());
+    }
+    m_outline = outline;
+    m_apertureShape = ApertureShape::Freeform;
+    m_spotlightRectSize = box.size().toSize().expandedTo(QSize(kMinimumSpotlightRectWidth, kMinimumSpotlightRectHeight));
+    m_spotlightRectSize.setWidth(qMin(m_spotlightRectSize.width(), width()));
+    m_spotlightRectSize.setHeight(qMin(m_spotlightRectSize.height(), height()));
+    m_spotlightCenter = box.center().toPoint();
+    m_spotlightZoom = 1.0;
+    m_drawingOutline = false;
+    m_stroke.clear();
+    unsetCursor();
+    clampSpotlightCenter();
+    applyBlur();
+    updateInputShape();
+    saveSettings();
+    update();
 }
 
 QRegion BlurWindow::spotlightInputRegion() const
@@ -1174,8 +1201,10 @@ QRegion BlurWindow::spotlightInputRegion() const
                       kSpotlightResizeMargin, kSpotlightResizeMargin).toAlignedRect();
         region += QRegion(bounds, m_apertureShape == ApertureShape::Circle ? QRegion::Ellipse : QRegion::Rectangle);
     }
-    if (m_addButton) {
-        region += m_addButton->geometry();
+    if (m_followingMouse && m_followMoving) {
+        const QRect wide = (m_apertureShape == ApertureShape::Circle ? spotlightRect() : spotlightRectangleRect())
+                               .adjusted(-kFollowMargin, -kFollowMargin, kFollowMargin, kFollowMargin).toAlignedRect();
+        region += QRegion(wide);
     }
     {
         if (m_apertureShape == ApertureShape::Circle) {
@@ -1189,14 +1218,6 @@ QRegion BlurWindow::spotlightInputRegion() const
                                   .toAlignedRect());
         }
     }
-
-    // Keep the interior interactive in either blur mode so it can be dragged.
-    region += QRegion(minimizeButtonRect().adjusted(-2, 0, 2, 2));
-    region += QRegion(modeButtonRect().adjusted(-2, 0, 2, 2));
-    region += QRegion(closeButtonRect().adjusted(-2, 0, 2, 2));
-    region += QRegion(circleShapeButtonRect().adjusted(-2, -2, 2, 2));
-    region += QRegion(rectangleShapeButtonRect().adjusted(-2, -2, 2, 2));
-    region += QRegion(invertButtonRect().adjusted(-2, -2, 2, 2));
     return region;
 }
 
@@ -1222,24 +1243,6 @@ QRect BlurWindow::closeButtonRect() const
                  0,
                  kTitleButtonWidth,
                  kTitleBarHeight);
-}
-
-QRect BlurWindow::circleShapeButtonRect() const
-{
-    return QRect(kShapeButtonMargin,
-                 height() - kShapeButtonMargin - kShapeButtonSize,
-                 kShapeButtonSize,
-                 kShapeButtonSize);
-}
-
-QRect BlurWindow::rectangleShapeButtonRect() const
-{
-    return circleShapeButtonRect().translated(kShapeButtonSize + kShapeButtonGap, 0);
-}
-
-QRect BlurWindow::invertButtonRect() const
-{
-    return rectangleShapeButtonRect().translated(kShapeButtonSize + kShapeButtonGap, 0);
 }
 
 QRect BlurWindow::handleRect() const
@@ -1273,7 +1276,7 @@ bool BlurWindow::isOnSpotlightBorder(const QPointF &position) const
     if (!isSpotlightMode()) {
         return false;
     }
-    if (m_apertureShape == ApertureShape::Rectangle) {
+    if (m_apertureShape != ApertureShape::Circle) {
         return spotlightRectEdgesAt(position.toPoint()) != NoEdge;
     }
     const qreal distance = QLineF(QPointF(m_spotlightCenter), position).length();
@@ -1284,6 +1287,9 @@ bool BlurWindow::isInsideAperture(const QPointF &position) const
 {
     if (m_apertureShape == ApertureShape::Circle) {
         return QLineF(QPointF(m_spotlightCenter), position).length() <= m_spotlightRadius;
+    }
+    if (m_apertureShape == ApertureShape::Freeform) {
+        return aperturePath(spotlightRectangleRect()).contains(position);
     }
     return spotlightRectangleRect().contains(position);
 }
@@ -1299,20 +1305,20 @@ QRegion BlurWindow::allAperturesRegion() const
 {
     QRegion region = apertureRegion();
     for (const Spotlight &spotlight : m_otherSpotlights) {
-        region += QRegion(spotlightBounds(spotlight).toAlignedRect(),
-                          m_apertureShape == ApertureShape::Circle ? QRegion::Ellipse : QRegion::Rectangle);
+        region += apertureRegionIn(spotlightBounds(spotlight));
     }
     return region;
 }
 
 void BlurWindow::addSpotlight()
 {
-    if (m_otherSpotlights.size() >= 15) {
+    if (m_otherSpotlights.size() >= kMaxSpotlights - 1) {
         return;
     }
-    m_otherSpotlights.append({m_spotlightCenter, m_spotlightRadius, m_spotlightRectSize, m_spotlightZoom});
+    cancelAutoTrack();
+    m_otherSpotlights.append({m_spotlightCenter, m_spotlightRadius, m_spotlightRectSize, m_spotlightZoom, m_tracker});
+    m_tracker = nullptr;
     m_spotlightZoom = 1.0;
-    m_addButton->setEnabled(m_otherSpotlights.size() < 15);
     m_spotlightCenter += QPoint(m_spotlightRadius + 60, 60);
     m_spotlightRadius = qMax(kMinimumSpotlightRadius, qRound(m_spotlightRadius * 0.7));
     m_spotlightRectSize = (m_spotlightRectSize * 0.7)
@@ -1335,11 +1341,12 @@ void BlurWindow::selectSpotlight(const QPoint &position)
                       kSpotlightResizeMargin, kSpotlightResizeMargin).toAlignedRect();
         if (QRegion(bounds, m_apertureShape == ApertureShape::Circle
                         ? QRegion::Ellipse : QRegion::Rectangle).contains(position)) {
-            m_otherSpotlights[i] = {m_spotlightCenter, m_spotlightRadius, m_spotlightRectSize, m_spotlightZoom};
+            m_otherSpotlights[i] = {m_spotlightCenter, m_spotlightRadius, m_spotlightRectSize, m_spotlightZoom, m_tracker};
             m_spotlightCenter = candidate.center;
             m_spotlightRadius = candidate.radius;
             m_spotlightRectSize = candidate.size;
             m_spotlightZoom = candidate.zoom;
+            m_tracker = candidate.tracker;
             return;
         }
     }
@@ -1347,6 +1354,8 @@ void BlurWindow::selectSpotlight(const QPoint &position)
 
 void BlurWindow::deleteSpotlight()
 {
+    cancelAutoTrack();
+    stopTracking();
     if (m_otherSpotlights.isEmpty()) {
         close();
         return;
@@ -1356,7 +1365,7 @@ void BlurWindow::deleteSpotlight()
     m_spotlightRadius = next.radius;
     m_spotlightRectSize = next.size;
     m_spotlightZoom = next.zoom;
-    m_addButton->setEnabled(true);
+    m_tracker = next.tracker;
     applyBlur();
     updateInputShape();
     update();
@@ -1364,23 +1373,30 @@ void BlurWindow::deleteSpotlight()
 
 void BlurWindow::publishZoomRegions()
 {
-    QJsonArray regions;
-    auto append = [this, &regions](const Spotlight &spotlight) {
-        if (spotlight.zoom <= 1.0) {
-            return;
-        }
+    QJsonArray apertures;
+    auto append = [this, &apertures](const Spotlight &spotlight) {
         const QRectF bounds = spotlightBounds(spotlight);
-        regions.append(QJsonArray{bounds.x(), bounds.y(), bounds.width(), bounds.height(), spotlight.zoom});
+        const double zoom = m_apertureShape == ApertureShape::Freeform ? 1.0 : spotlight.zoom; // no zoom for hand-drawn shapes
+        apertures.append(QJsonArray{bounds.x(), bounds.y(), bounds.width(), bounds.height(), zoom});
     };
-    if (isSpotlightMode() && isVisible() && !m_spotlightInverted) {
+    if (isSpotlightMode() && isVisible()) {
         for (const Spotlight &spotlight : m_otherSpotlights) {
             append(spotlight);
         }
         append({m_spotlightCenter, m_spotlightRadius, m_spotlightRectSize, m_spotlightZoom});
     }
-    const QJsonObject payload{{QStringLiteral("regions"), regions},
+    QJsonArray outline; // hand-drawn shape: at most 64 points, the effect cuts the apertures along them
+    if (m_apertureShape == ApertureShape::Freeform && m_outline.size() >= 3) {
+        const int step = (m_outline.size() + 63) / 64;
+        for (qsizetype i = 0; i < m_outline.size(); i += step) {
+            outline.append(m_outline.at(i).x());
+            outline.append(m_outline.at(i).y());
+        }
+    }
+    const QJsonObject payload{{QStringLiteral("apertures"), apertures},
                               {QStringLiteral("circle"), m_apertureShape == ApertureShape::Circle},
-                              {QStringLiteral("blurred"), m_spotlightInverted}};
+                              {QStringLiteral("outline"), outline},
+                              {QStringLiteral("inverted"), m_spotlightInverted}};
     QDBusMessage message = QDBusMessage::createMethodCall(QStringLiteral("org.kde.KWin"),
         QStringLiteral("/org/local/StableBlur"), QStringLiteral("org.local.StableBlur"), QStringLiteral("setZoomRegions"));
     message << QString::fromUtf8(QJsonDocument(payload).toJson(QJsonDocument::Compact));
@@ -1393,10 +1409,16 @@ void BlurWindow::clampSpotlightCenter()
         return;
     }
 
-    const int xMargin = m_apertureShape == ApertureShape::Circle ? m_spotlightRadius : m_spotlightRectSize.width() / 2;
-    const int yMargin = m_apertureShape == ApertureShape::Circle ? m_spotlightRadius : m_spotlightRectSize.height() / 2;
-    m_spotlightCenter.setX(qBound(xMargin, m_spotlightCenter.x(), qMax(xMargin, width() - xMargin)));
-    m_spotlightCenter.setY(qBound(yMargin, m_spotlightCenter.y(), qMax(yMargin, height() - yMargin)));
+    m_spotlightCenter = clampedCenter(m_spotlightCenter, m_spotlightRadius, m_spotlightRectSize);
+}
+
+QPoint BlurWindow::clampedCenter(QPoint center, int radius, const QSize &size) const
+{
+    const int xMargin = m_apertureShape == ApertureShape::Circle ? radius : size.width() / 2;
+    const int yMargin = m_apertureShape == ApertureShape::Circle ? radius : size.height() / 2;
+    center.setX(qBound(xMargin, center.x(), qMax(xMargin, width() - xMargin)));
+    center.setY(qBound(yMargin, center.y(), qMax(yMargin, height() - yMargin)));
+    return center;
 }
 
 void BlurWindow::drawTitleButtons(QPainter *painter)
@@ -1419,51 +1441,4 @@ void BlurWindow::drawTitleButtons(QPainter *painter)
                     m_closeHovered,
                     m_closePressed,
                     QStyle::SP_TitleBarCloseButton);
-}
-
-void BlurWindow::drawShapeButtons(QPainter *painter)
-{
-    auto drawButtonFrame = [painter](const QRect &rect, bool active, bool hovered, bool pressed) {
-        const QColor background = active ? QColor(61, 174, 233, 95)
-                                  : hovered ? QColor(245, 245, 245, 45)
-                                            : QColor(20, 20, 20, 120);
-        const QColor border = active ? QColor(61, 174, 233, 230) : QColor(245, 245, 245, 120);
-        const QColor icon = active ? QColor(255, 255, 255, 240) : QColor(245, 245, 245, 190);
-
-        QPainterPath path;
-        path.addRoundedRect(QRectF(rect), 6, 6);
-        painter->fillPath(path, background.darker(pressed ? 135 : 100));
-        painter->setPen(QPen(border, active ? 1.8 : 1.2));
-        painter->drawPath(path);
-        return icon;
-    };
-
-    auto drawShapeButton = [this, painter, drawButtonFrame](const QRect &rect, ApertureShape shape, bool hovered, bool pressed) {
-        const bool active = m_apertureShape == shape;
-        const QColor icon = drawButtonFrame(rect, active, hovered, pressed);
-
-        painter->setPen(QPen(icon, 2.0));
-        const QRectF iconRect = QRectF(rect).adjusted(10, 10, -10, -10);
-        if (shape == ApertureShape::Circle) {
-            painter->drawEllipse(iconRect);
-        } else {
-            painter->drawRoundedRect(iconRect, 2, 2);
-        }
-    };
-
-    drawShapeButton(circleShapeButtonRect(), ApertureShape::Circle, m_circleShapeHovered, m_circleShapePressed);
-    drawShapeButton(rectangleShapeButtonRect(), ApertureShape::Rectangle, m_rectangleShapeHovered, m_rectangleShapePressed);
-
-    const QRect invertRect = invertButtonRect();
-    const QColor icon = drawButtonFrame(invertRect, m_spotlightInverted, m_invertHovered, m_invertPressed);
-    const QRectF iconRect = QRectF(invertRect).adjusted(10, 10, -10, -10);
-    QPainterPath leftHalf;
-    leftHalf.moveTo(iconRect.topLeft());
-    leftHalf.lineTo(iconRect.topRight());
-    leftHalf.lineTo(iconRect.bottomLeft());
-    leftHalf.closeSubpath();
-    painter->fillPath(leftHalf, icon);
-    painter->setPen(QPen(icon, 2.0));
-    painter->drawRect(iconRect);
-    painter->drawLine(iconRect.topRight(), iconRect.bottomLeft());
 }

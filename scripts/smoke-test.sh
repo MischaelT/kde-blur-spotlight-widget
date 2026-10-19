@@ -11,6 +11,7 @@ cmake -S "$repo_dir" -B "$build_dir" \
 cmake --build "$build_dir" -j"${JOBS:-$(nproc)}"
 
 QT_QPA_PLATFORM=offscreen "$build_dir/blur-rectangle/blur-rectangle" --self-test
+"$build_dir/blur-rectangle/matcher-test" >/dev/null
 test -f "$build_dir/bin/kwin/effects/plugins/stableblur.so" \
   || test -f "$build_dir/tiny-blur-effect/bin/kwin/effects/plugins/stableblur.so"
 grep -q '"Name": "Stable Blur Spotlight"' "$repo_dir/tiny-blur-effect/metadata.json"

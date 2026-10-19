@@ -1,6 +1,11 @@
 #pragma once
 
 #include <QElapsedTimer>
+#include <QHash>
+#include <QPainterPath>
+#include <QPointF>
+#include <QPolygonF>
+#include <functional>
 #include <QPointer>
 #include <QSettings>
 #include <QWidget>
@@ -8,7 +13,8 @@
 
 class QMenu;
 class QSystemTrayIcon;
-class QToolButton;
+class QTimer;
+class Tracker;
 
 class BlurWindow : public QWidget
 {
@@ -18,6 +24,7 @@ public:
     explicit BlurWindow(QWidget *parent = nullptr);
     ~BlurWindow() override;
     void showDefaultMode();
+    void setTrackerFactory(std::function<Tracker *()> factory);
 
     enum Edge {
         NoEdge = 0,
@@ -36,6 +43,7 @@ public:
     enum class ApertureShape {
         Circle,
         Rectangle,
+        Freeform, // a hand-drawn outline, scaled into the rectangle box
     };
 
 protected:
@@ -58,16 +66,30 @@ private:
         int radius;
         QSize size;
         double zoom = 1.0;
+        Tracker *tracker = nullptr;
     };
     void addSpotlight();
     void deleteSpotlight();
+    void startTracking();
+    void cycleZoom();
+    void armAutoTrack();
+    void cancelAutoTrack();
+    void beginPendingTracking();
+    Tracker *launchTracker();
+    void registerTracking(Tracker *tracker);
+    void setAutoSize(bool enabled);
+    void stopTracking();
+    void stopTracker(Tracker *tracker);
+    void stopAllTracking();
+    void onTargetUpdated(Tracker *tracker, const QRectF &box);
+    void stepTracking();
+    QPoint clampedCenter(QPoint center, int radius, const QSize &size) const;
     void publishZoomRegions();
     double m_spotlightZoom = 1.0;
     void selectSpotlight(const QPoint &position);
     QRectF spotlightBounds(const Spotlight &spotlight) const;
     QRegion allAperturesRegion() const;
     QVector<Spotlight> m_otherSpotlights;
-    QToolButton *m_addButton = nullptr;
     void applyBlur();
     void createTrayIcon();
     void loadSettings();
@@ -77,6 +99,11 @@ private:
     void setInteractiveState(bool active);
     void setMode(Mode mode);
     void setApertureShape(ApertureShape shape);
+    void startDrawingOutline();
+    void finishOutline();
+    void cancelOutline();
+    QPainterPath aperturePath(const QRectF &bounds) const;
+    QRegion apertureRegionIn(const QRectF &bounds) const;
     void setSpotlightInverted(bool inverted);
     void setSpotlightRadius(int radius);
     void setSpotlightRectSize(const QSize &size);
@@ -91,9 +118,6 @@ private:
     QRect minimizeButtonRect() const;
     QRect modeButtonRect() const;
     QRect closeButtonRect() const;
-    QRect circleShapeButtonRect() const;
-    QRect rectangleShapeButtonRect() const;
-    QRect invertButtonRect() const;
     QRect handleRect() const;
     QRectF spotlightRect() const;
     QRectF spotlightRectangleRect() const;
@@ -102,7 +126,6 @@ private:
     bool isInsideAperture(const QPointF &position) const;
     void clampSpotlightCenter();
     void drawTitleButtons(QPainter *painter);
-    void drawShapeButtons(QPainter *painter);
 
     QSettings m_settings;
     QPointer<QSystemTrayIcon> m_trayIcon;
@@ -113,6 +136,9 @@ private:
     int m_blurLevel = 4;
     Mode m_mode = Mode::BlurRectangle;
     ApertureShape m_apertureShape = ApertureShape::Circle;
+    QPolygonF m_outline;        // freeform outline, points in 0..1 of the spotlight box
+    QPolygonF m_stroke;         // outline being drawn, in widget coordinates
+    bool m_drawingOutline = false;
     bool m_hovered = false;
     bool m_interacting = false;
     bool m_clickThrough = false;
@@ -120,18 +146,34 @@ private:
     bool m_draggingSpotlight = false;
     bool m_resizingSpotlight = false;
     bool m_followingMouse = false;
+    bool m_dragAutoTrack = false; // autotrack countdown started by a normal drag, still running after release
+    Tracker *m_tracker = nullptr;
+    struct TrackState {
+        QPointF position;
+        QPointF target;
+        QPointF velocity;
+        double baseWidth = 0;   // box width when tracking started
+        int baseRadius = 0;
+        QSize baseSize;
+    };
+    QHash<Tracker *, TrackState> m_trackStates;
+    QTimer *m_trackTimer = nullptr;
+    QTimer *m_idleTimer = nullptr;
+    QTimer *m_dotsTimer = nullptr;
+    QTimer *m_settleTimer = nullptr;
+    Tracker *m_pendingTracker = nullptr; // memorized when the pointer settled, followed once the countdown ends
+    QTimer *m_followMoveTimer = nullptr;
+    bool m_followMoving = false; // pointer moved lately while following: input area is widened
+    bool m_autoTrack = false;
+    bool m_autoSize = false;
+    QElapsedTimer m_trackClock;
+    std::function<Tracker *()> m_trackerFactory;
     bool m_minimizeHovered = false;
     bool m_minimizePressed = false;
     bool m_modeButtonHovered = false;
     bool m_modeButtonPressed = false;
     bool m_closeHovered = false;
     bool m_closePressed = false;
-    bool m_circleShapeHovered = false;
-    bool m_circleShapePressed = false;
-    bool m_rectangleShapeHovered = false;
-    bool m_rectangleShapePressed = false;
-    bool m_invertHovered = false;
-    bool m_invertPressed = false;
     bool m_spotlightInverted = false;
     Edges m_pressedEdges = NoEdge;
     Edges m_spotlightResizeEdges = NoEdge;

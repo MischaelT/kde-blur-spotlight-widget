@@ -33,6 +33,7 @@
 #include <QTimer>
 #include <QWindow>
 
+#include <algorithm>
 #include <array>
 
 Q_LOGGING_CATEGORY(KWIN_TINYBLUR, "kwin_effect_tinyblur", QtWarningMsg);
@@ -44,6 +45,10 @@ static void ensureResources()
 
 namespace KWin
 {
+
+// Logical pixels around an aperture that stay in the blur region so the
+// shader can antialias the edge.
+static constexpr int kApertureEdgeMargin = 2;
 
 static bool isBlurRectangleWindow(EffectWindow *w)
 {
@@ -112,6 +117,7 @@ TinyBlurEffect::TinyBlurEffect()
                                                                               QStringLiteral(":/effects/stableblur/shaders/onscreen.frag"));
     if (!m_onscreenPass.shader
         || m_onscreenPass.shader->uniformLocation("zoomFactors[0]") < 0
+        || m_onscreenPass.shader->uniformLocation("apertures[0]") < 0
         || m_onscreenPass.shader->uniformLocation("originalTexture") < 0) {
         qCWarning(KWIN_TINYBLUR) << "Failed to load onscreen pass shader";
         return;
@@ -173,19 +179,30 @@ TinyBlurEffect::~TinyBlurEffect()
 void TinyBlurEffect::setZoomRegions(const QString &json)
 {
     const QJsonObject payload = QJsonDocument::fromJson(json.toUtf8()).object();
-    m_zoomRegions.clear();
+    m_apertures.clear();
     m_zoomFactors.clear();
-    m_zoomCircle = payload.value(QStringLiteral("circle")).toBool();
-    m_zoomBlurred = payload.value(QStringLiteral("blurred")).toBool();
-    for (const QJsonValue &value : payload.value(QStringLiteral("regions")).toArray()) {
+    m_apertureCircle = payload.value(QStringLiteral("circle")).toBool();
+    m_apertureInverted = payload.value(QStringLiteral("inverted")).toBool();
+    m_outline.clear();
+    const QJsonArray outline = payload.value(QStringLiteral("outline")).toArray();
+    for (qsizetype i = 0; i + 1 < outline.size() && m_outline.size() < 64; i += 2) {
+        m_outline.append(QVector2D(outline[i].toDouble(), outline[i + 1].toDouble()));
+    }
+    if (m_outline.size() < 3) {
+        m_outline.clear();
+    }
+    if (!m_outline.isEmpty()) {
+        qCWarning(KWIN_TINYBLUR) << "freeform aperture outline with" << m_outline.size() << "points";
+    }
+    for (const QJsonValue &value : payload.value(QStringLiteral("apertures")).toArray()) {
         const QJsonArray rect = value.toArray();
-        if (m_zoomBlurred || (rect.size() != 4 && rect.size() != 5) || m_zoomRegions.size() >= 16) {
+        if (rect.size() != 5 || m_apertures.size() >= 16) {
             continue;
         }
         const QRectF bounds(rect[0].toDouble(), rect[1].toDouble(), rect[2].toDouble(), rect[3].toDouble());
         if (bounds.isValid()) {
-            m_zoomRegions.append(bounds);
-            m_zoomFactors.append(rect.size() == 5 ? float(qBound(1.0, rect[4].toDouble(1.15), 3.0)) : 1.15f);
+            m_apertures.append(bounds);
+            m_zoomFactors.append(m_apertureInverted ? 1.0f : float(qBound(1.0, rect[4].toDouble(1.0), 3.0)));
         }
     }
     for (EffectWindow *window : effects->stackingOrder()) {
@@ -307,7 +324,7 @@ void TinyBlurEffect::slotWindowAdded(EffectWindow *w)
 void TinyBlurEffect::slotWindowDeleted(EffectWindow *w)
 {
     if (isBlurRectangleWindow(w)) {
-        m_zoomRegions.clear();
+        m_apertures.clear();
         m_zoomFactors.clear();
     }
     if (auto it = m_windows.find(w); it != m_windows.end()) {
@@ -394,8 +411,11 @@ RegionF TinyBlurEffect::blurRegion(EffectWindow *w) const
     }
 
     if (isBlurRectangleWindow(w)) {
-        for (const QRectF &bounds : m_zoomRegions) {
-            region += RegionF(QRegion(bounds.toAlignedRect(), m_zoomCircle ? QRegion::Ellipse : QRegion::Rectangle));
+        // The shader cuts the exact aperture edge, so cover the whole bounding
+        // box plus a margin for the antialiased fringe.
+        for (const QRectF &bounds : m_apertures) {
+            region += RegionF(QRegion(bounds.adjusted(-kApertureEdgeMargin, -kApertureEdgeMargin,
+                                                      kApertureEdgeMargin, kApertureEdgeMargin).toAlignedRect()));
         }
     }
     return region;
@@ -411,7 +431,7 @@ void TinyBlurEffect::prePaintScreen(ScreenPrePaintData &data)
 void TinyBlurEffect::postPaintScreen()
 {
     effects->postPaintScreen();
-    if (!m_zoomRegions.isEmpty()) {
+    if (!m_apertureInverted && std::any_of(m_zoomFactors.cbegin(), m_zoomFactors.cend(), [](float f) { return f > 1.0f; })) {
         // Schedule after this frame's damage is consumed, so stationary lenses
         // continue sampling live content without waiting for pointer motion.
         effects->addRepaintFull();
@@ -766,17 +786,24 @@ void TinyBlurEffect::blur(const RenderTarget &renderTarget, const RenderViewport
         m_onscreenPass.shader->setUniform(m_onscreenPass.halfpixelLocation, halfpixel);
         m_onscreenPass.shader->setUniform(m_onscreenPass.offsetLocation, float(m_offset));
 
-        const int zoomCount = isBlurRectangleWindow(w) ? m_zoomRegions.size() : 0;
-        m_onscreenPass.shader->setUniform("zoomCount", zoomCount);
-        m_onscreenPass.shader->setUniform("zoomCircle", int(m_zoomCircle));
+        const int apertureCount = isBlurRectangleWindow(w) ? m_apertures.size() : 0;
+        m_onscreenPass.shader->setUniform("apertureCount", apertureCount);
+        m_onscreenPass.shader->setUniform("apertureCircle", int(m_apertureCircle));
+        m_onscreenPass.shader->setUniform("apertureInverted", int(m_apertureInverted));
+        m_onscreenPass.shader->setUniform("outlineCount", int(m_outline.size()));
+        for (int i = 0; i < m_outline.size(); ++i) {
+            m_onscreenPass.shader->setUniform(QStringLiteral("outline[%1]").arg(i).toLatin1().constData(), m_outline.at(i));
+        }
+        m_onscreenPass.shader->setUniform("rectSize", QVector2D(scaledBackgroundRect.width(), scaledBackgroundRect.height()));
+        m_onscreenPass.shader->setUniform("modulation", modulation);
         m_onscreenPass.shader->setUniform("originalTexture", 1);
-        for (int i = 0; i < zoomCount; ++i) {
-            const QRectF bounds = m_zoomRegions.at(i).translated(w->pos().x(), w->pos().y());
+        for (int i = 0; i < apertureCount; ++i) {
+            const QRectF bounds = m_apertures.at(i).translated(w->pos().x(), w->pos().y());
             const QVector4D normalized((bounds.center().x() - backgroundRect.x()) / backgroundRect.width(),
                                       1.0 - (bounds.center().y() - backgroundRect.y()) / backgroundRect.height(),
                                       bounds.width() / backgroundRect.width() / 2,
                                       bounds.height() / backgroundRect.height() / 2);
-            m_onscreenPass.shader->setUniform(QStringLiteral("zoomRegions[%1]").arg(i).toLatin1().constData(), normalized);
+            m_onscreenPass.shader->setUniform(QStringLiteral("apertures[%1]").arg(i).toLatin1().constData(), normalized);
             m_onscreenPass.shader->setUniform(QStringLiteral("zoomFactors[%1]").arg(i).toLatin1().constData(), m_zoomFactors.at(i));
         }
         glActiveTexture(GL_TEXTURE1);
@@ -785,7 +812,13 @@ void TinyBlurEffect::blur(const RenderTarget &renderTarget, const RenderViewport
 
         read->colorAttachment()->bind();
 
-        if (modulation < 1.0) {
+        // With apertures the shader outputs premultiplied color with a
+        // smooth coverage alpha; otherwise only the window opacity applies.
+        const bool blend = apertureCount > 0 || modulation < 1.0;
+        if (apertureCount > 0) {
+            glEnable(GL_BLEND);
+            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        } else if (modulation < 1.0) {
             glEnable(GL_BLEND);
             glBlendColor(0, 0, 0, modulation);
             glBlendFunc(GL_CONSTANT_ALPHA, GL_ONE_MINUS_CONSTANT_ALPHA);
@@ -793,7 +826,7 @@ void TinyBlurEffect::blur(const RenderTarget &renderTarget, const RenderViewport
 
         vbo->draw(GL_TRIANGLES, 6, vertexCount);
 
-        if (modulation < 1.0) {
+        if (blend) {
             glDisable(GL_BLEND);
         }
 
